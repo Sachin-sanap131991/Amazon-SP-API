@@ -1,0 +1,239 @@
+<?php 
+
+// --- Configuration (using environment variables as an example) ---
+$lwaClientId = getenv('LWA_CLIENT_ID');
+$lwaClientSecret = getenv('LWA_CLIENT_SECRET');
+$refreshToken = getenv('REFRESH_TOKEN');
+$inventoryFilePath = getenv('INVENTORY_FILE_PATH') ?: 'inventory_feed.tsv'; // Default if not set
+
+$storeName = 'YourStore'; // Identifier for your store
+$marketplaceId = 'ATVPDKIKX0DER'; // US Marketplace ID - Replace for other marketplaces
+$feedType = 'POST_FLAT_FILE_PRICEANDQUANTITYONLY_UPDATE_DATA'; // Feed type for inventory updates
+
+// Amazon API Endpoints
+$tokenUrl = '[https://api.amazon.com/auth/o2/token](https://api.amazon.com/auth/o2/token)';
+$feedsApiUrl = '[https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds](https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds)';
+$documentsApiUrl = '[https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents](https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents)';
+
+// --- Step 1: Obtain Access Token ---
+$tokenResponse = exchangeRefreshToken($tokenUrl, [
+    'grant_type' => 'refresh_token',
+    'refresh_token' => $refreshToken,
+    'client_id' => $lwaClientId,
+    'client_secret' => $lwaClientSecret,
+]);
+
+$accessToken = isset($tokenResponse->access_token) ? $tokenResponse->access_token : null;
+
+if (!$accessToken) {
+    echo "Failed to obtain access token for store: $storeName\n" . PHP_EOL;
+    exit(1); // Exit with an error code
+} else {
+    echo "Successfully obtained access token for store: $storeName\n";
+}
+
+// --- Step 2: Create Feed Document ---
+$fileContent = @file_get_contents($inventoryFilePath);
+if ($fileContent === false) {
+    echo "Error reading the feed file: $inventoryFilePath\n" . PHP_EOL;
+    exit(1);
+}
+
+$createDocumentResponse = createFeedDocument($documentsApiUrl, $accessToken, 'text/tab-separated-values; charset=UTF-8');
+
+$documentUrl = isset($createDocumentResponse->url) ? $createDocumentResponse->url : null;
+$feedDocumentId = isset($createDocumentResponse->feedDocumentId) ? $createDocumentResponse->feedDocumentId : null;
+
+if (!$documentUrl || !$feedDocumentId) {
+    echo "Failed to create feed document for store: $storeName\n";
+    if (isset($createDocumentResponse->errors[0]->message)) {
+        echo "Error: " . $createDocumentResponse->errors[0]->message . "\n";
+    }
+    exit(1);
+} else {
+    echo "Successfully created feed document. Document ID: $feedDocumentId, Upload URL: $documentUrl\n";
+}
+
+// --- Step 3: Upload Feed Content ---
+$uploadSuccess = uploadFeedContent($documentUrl, $fileContent, 'text/tab-separated-values; charset=UTF-8');
+
+if (!$uploadSuccess) {
+    echo "Failed to upload feed content for document ID: $feedDocumentId\n";
+    exit(1);
+} else {
+    echo "Successfully uploaded feed content for document ID: $feedDocumentId\n";
+}
+
+// --- Step 4: Create Feed ---
+$createFeedResponse = createFeed(
+    $feedsApiUrl,
+    $accessToken,
+    $feedType,
+    [$marketplaceId],
+    $feedDocumentId
+);
+
+$feedId = isset($createFeedResponse->feedId) ? $createFeedResponse->feedId : null;
+
+if (!$feedId) {
+    echo "Failed to create feed for store: $storeName\n";
+    if (isset($createFeedResponse->errors[0]->message)) {
+        echo "Error: " . $createFeedResponse->errors[0]->message . "\n";
+    }
+    exit(1);
+} else {
+    echo "Successfully created feed. Feed ID: $feedId\n";
+}
+
+// --- Helper Functions ---
+
+/**
+ * Exchanges a refresh token for an access token.
+ *
+ * @param string $url The token endpoint URL.
+ * @param array $params An array of parameters for the token request.
+ * @return object|null The JSON decoded response object, or null on error.
+ */
+function exchangeRefreshToken(string $url, array $params): ?object
+{
+    $curl = curl_init();
+    curl_setopt_array($curl, [
+        CURLOPT_URL => $url,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => http_build_query($params),
+        CURLOPT_RETURNTRANSFER => true,
+    ]);
+
+    $response = curl_exec($curl);
+    $error = curl_error($curl);
+
+    curl_close($curl);
+
+    if ($error) {
+        error_log("Error exchanging refresh token: " . $error);
+        return null;
+    }
+
+    return json_decode($response);
+}
+
+/**
+ * Creates a feed document in the Amazon Selling Partner API.
+ *
+ * @param string $url The feed documents endpoint URL.
+ * @param string $accessToken The access token.
+ * @param string $contentType The content type of the feed.
+ * @return object|null The JSON decoded response object, or null on error.
+ */
+function createFeedDocument(string $url, string $accessToken, string $contentType): ?object
+{
+    $feedContent = ['contentType' => $contentType];
+
+    $curl = curl_init();
+    curl_setopt_array($curl, [
+        CURLOPT_URL => $url,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode($feedContent),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $accessToken,
+            'x-amz-access-token: ' . $accessToken,
+            'Content-Type: application/json',
+        ],
+    ]);
+
+    $response = curl_exec($curl);
+    $error = curl_error($curl);
+
+    curl_close($curl);
+
+    if ($error) {
+        error_log("Error creating feed document: " . $error);
+        return null;
+    }
+
+    return json_decode($response);
+}
+
+/**
+ * Uploads the content to the pre-signed URL provided by Amazon.
+ *
+ * @param string $url The pre-signed URL for uploading the feed content.
+ * @param string $fileContent The content of the feed file.
+ * @param string $contentType The content type of the feed.
+ * @return bool True on success, false on failure.
+ */
+function uploadFeedContent(string $url, string $fileContent, string $contentType): bool
+{
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_CUSTOMREQUEST => 'PUT',
+        CURLOPT_POSTFIELDS => $fileContent,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: ' . $contentType,
+            'Content-Length: ' . strlen($fileContent),
+        ],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => true, // Recommended for security
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+
+    curl_close($ch);
+
+    if ($error) {
+        error_log("Error uploading feed content: " . $error);
+        return false;
+    }
+
+    return ($httpCode >= 200 && $httpCode < 300);
+}
+
+/**
+ * Creates a new feed in the Amazon Selling Partner API.
+ *
+ * @param string $url The feeds endpoint URL.
+ * @param string $accessToken The access token.
+ * @param string $feedType The type of feed to create.
+ * @param array $marketplaceIds An array of marketplace IDs.
+ * @param string $inputFeedDocumentId The ID of the feed document containing the data.
+ * @return object|null The JSON decoded response object, or null on error.
+ */
+function createFeed(string $url, string $accessToken, string $feedType, array $marketplaceIds, string $inputFeedDocumentId): ?object
+{
+    $requestData = [
+        'feedType' => $feedType,
+        'marketplaceIds' => $marketplaceIds,
+        'inputFeedDocumentId' => $inputFeedDocumentId,
+    ];
+
+    $curl = curl_init();
+    curl_setopt_array($curl, [
+        CURLOPT_URL => $url,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode($requestData),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $accessToken,
+            'x-amz-access-token: ' . $accessToken,
+            'Content-Type: application/json',
+        ],
+    ]);
+
+    $response = curl_exec($curl);
+    $error = curl_error($curl);
+
+    curl_close($curl);
+
+    if ($error) {
+        error_log("Error creating feed: " . $error);
+        return null;
+    }
+
+    return json_decode($response);
+}
+
+?>
